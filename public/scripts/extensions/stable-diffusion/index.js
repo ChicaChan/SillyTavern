@@ -45,6 +45,7 @@ import { getMessageTimeStamp, humanizedDateTime } from '../../RossAscends-mods.j
 import { SECRET_KEYS, secret_state } from '../../secrets.js';
 import { getNovelAnlas, getNovelUnlimitedImageGeneration, loadNovelSubscriptionData } from '../../nai-settings.js';
 import { getMultimodalCaption } from '../shared.js';
+import { removeReasoningFromString } from '../../reasoning.js';
 import { SlashCommandParser } from '../../slash-commands/SlashCommandParser.js';
 import { SlashCommand } from '../../slash-commands/SlashCommand.js';
 import {
@@ -2277,6 +2278,9 @@ async function loadDrawthingsModels() {
 
 async function loadOpenAiModels() {
     return [
+        { value: 'nano-banana', text: 'nano-banana' },
+        { value: 'grok-imagine-1.0', text: 'grok-imagine-1.0' },
+        { value: 'grok-imagine-1.0-video', text: 'grok-imagine-1.0-video' },
         { value: 'gpt-image-1.5', text: 'gpt-image-1.5' },
         { value: 'gpt-image-1-mini', text: 'gpt-image-1-mini' },
         { value: 'gpt-image-1', text: 'gpt-image-1' },
@@ -2776,6 +2780,35 @@ function getQuietPrompt(mode, trigger) {
 }
 
 /**
+ * Removes common non-prompt artifacts from model replies.
+ * @param {string} str String to clean
+ * @returns {string} Cleaned string
+ */
+function stripPromptNoise(str) {
+    if (!str) {
+        return '';
+    }
+
+    str = String(str);
+    str = removeReasoningFromString(str);
+    str = str.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, ' ');
+    str = str.replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, ' ');
+    str = str.replace(/```[\s\S]*?```/g, ' ');
+    str = str.replace(/`{1,3}[^`]*`{1,3}/g, ' ');
+    str = str.replace(/!\[[^\]]*]\([^)]+\)/g, ' ');
+    str = str.replace(/\[[^\]]*]\((https?:\/\/|data:)[^)]+\)/gi, ' ');
+    str = str.replace(/<img\b[^>]*>/gi, ' ');
+    str = str.replace(/<[^>]+>/g, ' ');
+    str = str.replace(/external media has been blocked/gi, ' ');
+    str = str.replace(/use the ['"]?ext\.?\s*media['"]? button to allow it\.?/gi, ' ');
+    str = str.replace(/^\s*(?:prompt|image prompt|提示词|关键词)\s*[:：-]\s*/i, '');
+    str = str.replace(/\u200b/g, '');
+    str = str.trim();
+
+    return str;
+}
+
+/**
  * Sanitizes generated prompt for image generation.
  * @param {string} str String to process
  * @returns {string} Processed reply
@@ -2784,6 +2817,8 @@ function processReply(str) {
     if (!str) {
         return '';
     }
+
+    str = stripPromptNoise(str);
 
     if (extension_settings.sd.minimal_prompt_processing) {
         // Minimal prompt processing
@@ -2799,8 +2834,8 @@ function processReply(str) {
     str = str.replaceAll('\n', ', ');
     str = str.normalize('NFD');
 
-    // Strip out non-alphanumeric characters barring model syntax exceptions
-    str = str.replace(/[^a-zA-Z0-9.,:_(){}<>[\]/\-'|#]+/g, ' ');
+    // Strip out unsupported characters while keeping multilingual text.
+    str = str.replace(/[^\p{L}\p{N}.,:_(){}<>[\]/\-'|#]+/gu, ' ');
 
     str = str.replace(/\s+/g, ' '); // Collapse multiple whitespaces into one
     str = str.trim();
@@ -2821,8 +2856,17 @@ function getRawLastMessage() {
                 continue;
             }
 
+            const mes = String(message.mes || '').trim();
+            const hasMedia = Array.isArray(message?.extra?.media) && message.extra.media.length > 0;
+            const isImageTemplate = /^\[[^\]]*sends a (picture|video) that contains:/i.test(mes);
+            const isUiWarning = /external media has been blocked|ext\.?\s*media/i.test(mes);
+
+            if (!mes || hasMedia || isImageTemplate || isUiWarning) {
+                continue;
+            }
+
             return {
-                mes: message.mes,
+                mes: mes,
                 original_avatar: message.original_avatar,
             };
         }
@@ -3219,8 +3263,32 @@ function getUserAvatarUrl() {
  */
 async function generatePrompt(quietPrompt) {
     const toast = toastr.info('Generating image prompt with an LLM...', 'Image Generation');
-    const reply = await generateQuietPrompt({ quietPrompt });
-    const processedReply = processReply(reply);
+    let processedReply = '';
+
+    // First try the regular quiet generation path.
+    try {
+        const reply = await generateQuietPrompt({ quietPrompt });
+        processedReply = processReply(reply);
+    } catch (error) {
+        console.warn('Image prompt generation (quiet) failed, trying fallback mode.', error);
+    }
+
+    // Some templates/providers may return an empty quiet reply.
+    // Retry in "loud" mode to avoid template edge-cases seen in the wild.
+    if (!processedReply) {
+        try {
+            const retryReply = await generateQuietPrompt({ quietPrompt, quietToLoud: true });
+            processedReply = processReply(retryReply);
+        } catch (error) {
+            console.warn('Image prompt generation (loud retry) failed, trying raw last message fallback.', error);
+        }
+    }
+
+    // Last-resort fallback: use the raw last message to keep image generation functional.
+    if (!processedReply) {
+        processedReply = processReply(getRawLastMessage());
+    }
+
     toastr.clear(toast);
 
     if (!processedReply) {
@@ -4062,6 +4130,7 @@ async function generateOpenAiImage(prompt, signal) {
             style: isDalle3 ? extension_settings.sd.openai_style : undefined,
             response_format: isDalle2 || isDalle3 ? 'b64_json' : undefined,
             moderation: isGptImg ? 'low' : undefined,
+            reverse_proxy: extension_settings.sd.openai_reverse_proxy || undefined,
         }),
     });
 

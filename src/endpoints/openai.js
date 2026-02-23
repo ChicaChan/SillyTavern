@@ -532,7 +532,7 @@ router.post('/nanogpt/models/embedding', async (request, response) => {
 
 router.post('/generate-image', async (request, response) => {
     try {
-        const key = readSecret(request.user.directories, SECRET_KEYS.OPENAI);
+        const key = request.body.proxy_password || readSecret(request.user.directories, SECRET_KEYS.OPENAI);
 
         if (!key) {
             console.warn('No OpenAI key found');
@@ -541,13 +541,21 @@ router.post('/generate-image', async (request, response) => {
 
         console.debug('OpenAI request', request.body);
 
-        const result = await fetch('https://api.openai.com/v1/images/generations', {
+        const apiUrl = request.body.reverse_proxy
+            ? `${trimV1(request.body.reverse_proxy)}/v1/images/generations`
+            : 'https://api.openai.com/v1/images/generations';
+
+        const requestBody = { ...request.body };
+        delete requestBody.reverse_proxy;
+        delete requestBody.proxy_password;
+
+        const result = await fetch(apiUrl, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 Authorization: `Bearer ${key}`,
             },
-            body: JSON.stringify(request.body),
+            body: JSON.stringify(requestBody),
         });
 
         if (!result.ok) {
@@ -556,7 +564,23 @@ router.post('/generate-image', async (request, response) => {
             return response.status(500).send(text);
         }
 
+        /** @type {any} */
         const data = await result.json();
+
+        // Some OpenAI-compatible providers return image URL instead of b64_json.
+        // Convert first image URL to base64 so frontend can keep using one parse path.
+        if (Array.isArray(data?.data) && data.data[0]?.url && !data.data[0]?.b64_json) {
+            try {
+                const imageResult = await fetch(data.data[0].url);
+                if (imageResult.ok) {
+                    const imageBuffer = Buffer.from(await imageResult.arrayBuffer());
+                    data.data[0].b64_json = imageBuffer.toString('base64');
+                }
+            } catch (error) {
+                console.warn('OpenAI-compatible image URL fetch failed', error);
+            }
+        }
+
         return response.json(data);
     } catch (error) {
         console.error(error);
